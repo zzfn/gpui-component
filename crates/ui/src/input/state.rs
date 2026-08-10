@@ -3080,7 +3080,13 @@ impl EntityInputHandler for InputState {
         let last_layout = self.last_layout.as_ref()?;
         let line_height = last_layout.line_height;
         let line_number_width = last_layout.line_number_width;
-        let range = self.range_from_utf16(&range_utf16);
+        // AppKit may ask for a stale or unrelated character range while an
+        // IME composition is active. The marked range maintained by the input
+        // handler is the authoritative anchor for the candidate window.
+        let range = self
+            .ime_marked_range
+            .map(|marked_range| marked_range.start..marked_range.start)
+            .unwrap_or_else(|| self.range_from_utf16(&range_utf16));
 
         let mut start_origin = None;
         let mut end_origin = None;
@@ -3929,6 +3935,36 @@ ORDER BY id
                 assert_eq!(state.value(), "你好 sh");
                 assert_eq!(state.selected_range(), 9..9);
                 assert_eq!(state.ime_marked_range, Some((7..9).into()));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_ime_bounds_use_marked_range_for_stale_native_range(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state.default_value("你好"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_selected_range(6..6, cx);
+                state.replace_and_mark_text_in_range(None, "s", Some(1..1), window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let bounds = state.last_bounds.expect("input should have been painted");
+                let candidate_bounds = state
+                    .bounds_for_range(0..0, bounds, window, cx)
+                    .expect("candidate bounds should be available");
+
+                assert!(
+                    candidate_bounds.origin.x > bounds.origin.x,
+                    "IME candidate should anchor after the existing text, not at the input origin"
+                );
             });
         });
     }
