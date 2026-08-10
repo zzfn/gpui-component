@@ -3059,10 +3059,13 @@ impl EntityInputHandler for InputState {
         self.mode.update_auto_grow(&self.display_map);
         self.history.start_grouping();
         self.push_history(&old_text, &range, new_text);
-        // The marked range and selection can move on every composition update.
-        // Ask GPUI to refresh the native IME candidate window anchor on the
-        // next frame instead of keeping the previous character coordinates.
-        window.invalidate_character_coordinates();
+        // GPUI runs `on_next_frame` callbacks before drawing the next frame.
+        // The input layout saved by `Input::paint` still describes the text
+        // before this composition update at that point, so defer the actual
+        // coordinate refresh once more until the new layout has been painted.
+        window.on_next_frame(|window, _| {
+            window.invalidate_character_coordinates();
+        });
         cx.notify();
     }
 
@@ -3114,8 +3117,11 @@ impl EntityInputHandler for InputState {
             y_offset += line.size(line_height).height;
         }
 
-        let start_origin = start_origin.unwrap_or_default();
-        let mut end_origin = end_origin.unwrap_or_default();
+        // A composition update can arrive before the new text has been laid
+        // out. Do not turn a missing position into (0, 0), because GPUI uses
+        // this value to position the native IME candidate window.
+        let start_origin = start_origin?;
+        let mut end_origin = end_origin?;
         // Ensure at same line.
         end_origin.y = start_origin.y;
 
