@@ -3059,6 +3059,10 @@ impl EntityInputHandler for InputState {
         self.mode.update_auto_grow(&self.display_map);
         self.history.start_grouping();
         self.push_history(&old_text, &range, new_text);
+        // The marked range and selection can move on every composition update.
+        // Ask GPUI to refresh the native IME candidate window anchor on the
+        // next frame instead of keeping the previous character coordinates.
+        window.invalidate_character_coordinates();
         cx.notify();
     }
 
@@ -3904,6 +3908,16 @@ ORDER BY id
             input.update(cx, |state, cx| {
                 state.set_selected_range(7..7, cx);
                 state.replace_and_mark_text_in_range(None, "s", Some(1..1), window, cx);
+
+                assert_eq!(state.value(), "你好 s");
+                assert_eq!(state.selected_range(), 8..8);
+                assert_eq!(state.ime_marked_range, Some((7..8).into()));
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
                 state.replace_and_mark_text_in_range(None, "sh", Some(2..2), window, cx);
 
                 assert_eq!(state.value(), "你好 sh");
