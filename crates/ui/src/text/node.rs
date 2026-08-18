@@ -1763,13 +1763,15 @@ impl Paragraph {
                     if text.is_empty() {
                         continue;
                     }
-                    let (mut highlights, links) = highlights_from_marks(&marks, node_cx, cx);
+                    let (highlights, links) = highlights_from_marks(&marks, node_cx, cx);
                     let mut code_style = node_cx.style.inline_code_highlight(cx);
                     let background = code_style
                         .background_color
                         .unwrap_or_else(|| cx.theme().accent);
                     code_style.background_color = None;
-                    highlights.insert(0, (0..text.len(), code_style));
+                    let highlights =
+                        gpui::combine_highlights(vec![(0..text.len(), code_style)], highlights)
+                            .collect();
                     if let Ok(mut state) = state.lock() {
                         state.set_text(text.clone().into());
                     }

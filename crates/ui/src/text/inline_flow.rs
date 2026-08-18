@@ -851,18 +851,34 @@ fn runs_for_highlights(
     default_style: &TextStyle,
     highlights: Vec<(Range<usize>, HighlightStyle)>,
 ) -> Vec<TextRun> {
+    let mut highlights: Vec<_> = gpui::combine_highlights(Vec::new(), highlights).collect();
+    highlights.retain(|(range, _)| {
+        range.start < range.end
+            && range.end <= text.len()
+            && text.is_char_boundary(range.start)
+            && text.is_char_boundary(range.end)
+    });
+    highlights.sort_by_key(|(range, _)| range.start);
+
     let mut runs = Vec::new();
     let mut ix = 0;
 
     for (range, highlight) in highlights {
-        if ix < range.start {
-            runs.push(default_style.clone().to_run(range.start - ix));
+        if range.end <= ix {
+            continue;
+        }
+        let start = range.start.max(ix);
+        if start >= range.end || !text.is_char_boundary(start) {
+            continue;
+        }
+        if ix < start {
+            runs.push(default_style.clone().to_run(start - ix));
         }
         runs.push(
             default_style
                 .clone()
                 .highlight(highlight)
-                .to_run(range.len()),
+                .to_run(range.end - start),
         );
         ix = range.end;
     }
@@ -907,6 +923,33 @@ mod tests {
     #[test]
     fn inline_code_chip_reserves_horizontal_padding() {
         assert_eq!(code_chip_size(px(40.), px(20.)), size(px(50.), px(20.)));
+    }
+
+    #[test]
+    fn overlapping_code_highlights_do_not_overflow_shaped_runs() {
+        // 复现：行内 `code` 会先铺一整段 highlight，再叠 bold/link。
+        // 旧 runs_for_highlights 按区间原样累加，总长度超过文本，
+        // shape_line 在 CJK 边界上 slice 会 panic。
+        let text = "任务.rs";
+        let first_char = text.chars().next().unwrap().len_utf8();
+        let mut bold = HighlightStyle::default();
+        bold.font_weight = Some(gpui::FontWeight::BOLD);
+        let runs = runs_for_highlights(
+            text,
+            &TextStyle::default(),
+            vec![
+                (0..text.len(), HighlightStyle::default()),
+                (0..first_char, bold),
+            ],
+        );
+        let covered: usize = runs.iter().map(|run| run.len).sum();
+        assert_eq!(covered, text.len());
+        let mut offset = 0;
+        for run in &runs {
+            assert!(text.is_char_boundary(offset));
+            offset += run.len;
+            assert!(text.is_char_boundary(offset));
+        }
     }
 
     #[test]
