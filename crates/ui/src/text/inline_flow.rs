@@ -5,16 +5,21 @@ use std::{
 
 use gpui::{
     AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId,
-    GlobalElementId, HighlightStyle, InspectorElementId, InteractiveElement as _, IntoElement,
-    LayoutId, LineFragment as WrapLineFragment, ObjectFit, Pixels, ShapedLine, SharedString,
-    SharedUri, Size, StatefulInteractiveElement as _, Styled, StyledImage as _, TextRun, TextStyle,
-    WhiteSpace, Window, img, point, prelude::FluentBuilder as _, px, relative, size,
+    GlobalElementId, HighlightStyle, Hsla, InspectorElementId, InteractiveElement as _,
+    IntoElement, LayoutId, LineFragment as WrapLineFragment, ObjectFit, ParentElement as _, Pixels,
+    ShapedLine, SharedString, SharedUri, Size, StatefulInteractiveElement as _, Styled,
+    StyledImage as _, TextRun, TextStyle, WhiteSpace, Window, img, point,
+    prelude::FluentBuilder as _, px, relative, size,
 };
 
 use crate::{
+    h_flex,
     text::text_view::{LinkClickHandlerFn, handle_link_click},
     tooltip::Tooltip,
 };
+
+/// Horizontal padding reserved around inline `code` chips.
+pub(super) const INLINE_CODE_PAD_X: Pixels = px(5.);
 
 use super::{
     inline::{Inline, InlineState},
@@ -36,6 +41,13 @@ pub(super) enum InlineFlowItem {
         text: SharedString,
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
+    },
+    Code {
+        state: Arc<Mutex<InlineState>>,
+        text: SharedString,
+        links: Vec<(Range<usize>, LinkMark)>,
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
+        background: Hsla,
     },
     Image {
         url: SharedUri,
@@ -68,6 +80,11 @@ enum PositionedFragment {
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
     },
+    Code {
+        item_ix: usize,
+        origin: gpui::Point<Pixels>,
+        size: Size<Pixels>,
+    },
     Image {
         item_ix: usize,
         origin: gpui::Point<Pixels>,
@@ -79,6 +96,10 @@ enum MeasureItem {
     Text {
         text: SharedString,
         links: Vec<(Range<usize>, LinkMark)>,
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
+    },
+    Code {
+        text: SharedString,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
     },
     Image {
@@ -101,6 +122,7 @@ enum LineFragmentKind {
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
     },
+    Code,
     Image,
 }
 
@@ -162,6 +184,36 @@ impl InlineFlow {
             })
             .into_any_element()
     }
+
+    fn code_element(
+        ix: usize,
+        state: Arc<Mutex<InlineState>>,
+        text: SharedString,
+        links: Vec<(Range<usize>, LinkMark)>,
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
+        size: Size<Pixels>,
+        background: Hsla,
+        link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    ) -> AnyElement {
+        if let Ok(mut state) = state.lock() {
+            state.set_text(text);
+        }
+        h_flex()
+            .id(ix)
+            .h(size.height)
+            .px(INLINE_CODE_PAD_X)
+            .items_center()
+            .rounded(px(4.))
+            .bg(background)
+            .child(Inline::new(
+                ix,
+                state,
+                links,
+                highlights,
+                link_click_handler,
+            ))
+            .into_any_element()
+    }
 }
 
 impl IntoElement for InlineFlow {
@@ -194,6 +246,7 @@ impl Element for InlineFlow {
         let measure_items = self.items.iter().map(MeasureItem::from).collect::<Vec<_>>();
         let line_height = window.line_height();
         let rem_size = window.rem_size();
+        let text_style = window.text_style();
         let image_sizes = measure_items
             .iter()
             .enumerate()
@@ -208,6 +261,9 @@ impl Element for InlineFlow {
                     window,
                     cx,
                 )),
+                MeasureItem::Code { text, highlights } => {
+                    Some(measure_code_size(text, highlights, &text_style, window))
+                }
                 MeasureItem::Text { .. } => None,
             })
             .collect::<Vec<_>>();
@@ -303,6 +359,42 @@ impl Element for InlineFlow {
                     );
                     elements.push(element);
                 }
+                PositionedFragment::Code {
+                    item_ix,
+                    origin,
+                    size: fragment_size,
+                } => {
+                    let InlineFlowItem::Code {
+                        state,
+                        text,
+                        links,
+                        highlights,
+                        background,
+                    } = &self.items[item_ix]
+                    else {
+                        continue;
+                    };
+                    let mut element = Self::code_element(
+                        elements.len(),
+                        state.clone(),
+                        text.clone(),
+                        links.clone(),
+                        highlights.clone(),
+                        fragment_size,
+                        *background,
+                        self.link_click_handler.clone(),
+                    );
+                    element.prepaint_as_root(
+                        bounds.origin + origin,
+                        size(
+                            AvailableSpace::Definite(fragment_size.width),
+                            AvailableSpace::Definite(fragment_size.height),
+                        ),
+                        window,
+                        cx,
+                    );
+                    elements.push(element);
+                }
                 PositionedFragment::Image {
                     item_ix,
                     origin,
@@ -369,6 +461,12 @@ impl From<&InlineFlowItem> for MeasureItem {
                 links: links.clone(),
                 highlights: highlights.clone(),
             },
+            InlineFlowItem::Code {
+                text, highlights, ..
+            } => MeasureItem::Code {
+                text: text.clone(),
+                highlights: highlights.clone(),
+            },
             InlineFlowItem::Image {
                 url, width, height, ..
             } => MeasureItem::Image {
@@ -384,6 +482,7 @@ impl MeasureItem {
     fn len(&self) -> usize {
         match self {
             MeasureItem::Text { text, .. } => text.len(),
+            MeasureItem::Code { text, .. } => text.len().max(1),
             MeasureItem::Image { .. } => IMAGE_LEN,
         }
     }
@@ -458,6 +557,20 @@ fn layout_flow(
                         });
                     }
                 }
+                MeasureItem::Code { .. } => {
+                    if line_range.start <= item_start && item_end <= line_range.end {
+                        let size = image_sizes[item_ix]
+                            .expect("code size should be measured before layout");
+                        line_width += size.width;
+                        actual_line_height = actual_line_height.max(size.height);
+                        line_fragments.push(LineFragmentLayout {
+                            item_ix,
+                            kind: LineFragmentKind::Code,
+                            size,
+                            source_range: 0..item.len(),
+                        });
+                    }
+                }
                 MeasureItem::Image { .. } => {
                     if line_range.start <= item_start && item_end <= line_range.end {
                         let size = image_sizes[item_ix]
@@ -493,6 +606,11 @@ fn layout_flow(
                     text,
                     links,
                     highlights,
+                },
+                LineFragmentKind::Code => PositionedFragment::Code {
+                    item_ix: fragment.item_ix,
+                    origin,
+                    size: fragment.size,
                 },
                 LineFragmentKind::Image => PositionedFragment::Image {
                     item_ix: fragment.item_ix,
@@ -564,6 +682,16 @@ fn line_ranges(
                             let end = hard_line.end.min(item_end) - item_start;
                             (start < end).then(|| WrapLineFragment::text(&text[start..end]))
                         }
+                        MeasureItem::Code { text, .. } => (hard_line.start <= item_start
+                            && item_end <= hard_line.end)
+                            .then(|| {
+                                WrapLineFragment::element(
+                                    image_sizes[ix]
+                                        .expect("code size should be measured before wrapping")
+                                        .width,
+                                    text.len().max(1),
+                                )
+                            }),
                         MeasureItem::Image { .. } => (hard_line.start <= item_start
                             && item_end <= hard_line.end)
                             .then(|| {
@@ -600,6 +728,27 @@ fn line_ranges(
     }
 
     ranges
+}
+
+fn measure_code_size(
+    text: &str,
+    highlights: &[(Range<usize>, HighlightStyle)],
+    text_style: &TextStyle,
+    window: &mut Window,
+) -> Size<Pixels> {
+    let font_size = text_style.font_size.to_pixels(window.rem_size());
+    let runs = runs_for_highlights(text, text_style, highlights.to_vec());
+    let shaped = shape_line(
+        SharedString::from(text.to_string()),
+        font_size,
+        &runs,
+        window,
+    );
+    code_chip_size(shaped.width(), window.line_height())
+}
+
+fn code_chip_size(text_width: Pixels, line_height: Pixels) -> Size<Pixels> {
+    size(text_width + INLINE_CODE_PAD_X * 2., line_height)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -754,6 +903,11 @@ fn slice_ranges<T, U>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_code_chip_reserves_horizontal_padding() {
+        assert_eq!(code_chip_size(px(40.), px(20.)), size(px(50.), px(20.)));
+    }
 
     #[test]
     fn inline_image_without_explicit_size_scales_intrinsic_ratio_to_line_height() {

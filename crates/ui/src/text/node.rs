@@ -1132,6 +1132,177 @@ impl Paragraph {
     pub(crate) fn merge(&mut self, other: Self) {
         self.children.extend(other.children);
     }
+
+    fn has_inline_code(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| child.marks.iter().any(|(_, mark)| mark.code))
+    }
+}
+
+/// Paragraph pieces after splitting out inline code so it can be laid out as a
+/// padded chip instead of a flush `HighlightStyle` background.
+#[derive(Clone, Debug)]
+pub(super) enum ParagraphSegment {
+    Text {
+        text: String,
+        marks: Vec<(Range<usize>, TextMark)>,
+        state: Arc<Mutex<InlineState>>,
+    },
+    Code {
+        text: String,
+        marks: Vec<(Range<usize>, TextMark)>,
+        state: Arc<Mutex<InlineState>>,
+    },
+    Image(ImageNode),
+}
+
+fn code_ranges(node: &InlineNode) -> Vec<Range<usize>> {
+    let mut ranges = node
+        .marks
+        .iter()
+        .filter(|(_, mark)| mark.code)
+        .map(|(range, _)| range.clone())
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| range.start);
+    ranges.dedup();
+    ranges
+}
+
+fn marks_in_range(
+    node: &InlineNode,
+    range: &Range<usize>,
+    include_code: bool,
+) -> Vec<(Range<usize>, TextMark)> {
+    node.marks
+        .iter()
+        .filter_map(|(mark_range, mark)| {
+            if mark.code && !include_code {
+                return None;
+            }
+            let start = mark_range.start.max(range.start);
+            let end = mark_range.end.min(range.end);
+            (start < end).then(|| {
+                let mut mark = mark.clone();
+                if !include_code {
+                    mark.code = false;
+                }
+                ((start - range.start)..(end - range.start), mark)
+            })
+        })
+        .collect()
+}
+
+fn append_text_segment(
+    node: &InlineNode,
+    range: Range<usize>,
+    text: &mut String,
+    marks: &mut Vec<(Range<usize>, TextMark)>,
+    state: &mut Option<Arc<Mutex<InlineState>>>,
+    offset: &mut usize,
+) {
+    if range.start >= range.end {
+        return;
+    }
+    let slice = &node.text.as_ref()[range.clone()];
+    if slice.is_empty() {
+        return;
+    }
+    let start = *offset;
+    text.push_str(slice);
+    for (mark_range, mark) in marks_in_range(node, &range, false) {
+        marks.push(((start + mark_range.start)..(start + mark_range.end), mark));
+    }
+    if state.is_none() {
+        *state = Some(node.state.clone());
+    }
+    *offset += slice.len();
+}
+
+fn flush_text_segment(
+    out: &mut Vec<ParagraphSegment>,
+    text: &mut String,
+    marks: &mut Vec<(Range<usize>, TextMark)>,
+    state: &mut Option<Arc<Mutex<InlineState>>>,
+    offset: &mut usize,
+) {
+    if text.is_empty() {
+        return;
+    }
+    out.push(ParagraphSegment::Text {
+        text: std::mem::take(text),
+        marks: std::mem::take(marks),
+        state: state
+            .take()
+            .unwrap_or_else(|| Arc::new(Mutex::new(InlineState::default()))),
+    });
+    *offset = 0;
+}
+
+/// Split paragraph children so inline `code` becomes its own segment.
+pub(super) fn split_paragraph_segments(children: &[InlineNode]) -> Vec<ParagraphSegment> {
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let mut marks = Vec::new();
+    let mut state = None;
+    let mut offset = 0;
+
+    for node in children {
+        if let Some(image) = &node.image {
+            // The run before an image is stored on the image node's state so
+            // `selected_source` can map selection offsets back to children.
+            if !text.is_empty() {
+                out.push(ParagraphSegment::Text {
+                    text: std::mem::take(&mut text),
+                    marks: std::mem::take(&mut marks),
+                    state: node.state.clone(),
+                });
+                state = None;
+                offset = 0;
+            }
+            out.push(ParagraphSegment::Image(image.clone()));
+            continue;
+        }
+
+        let node_text = node.text.as_ref();
+        let mut cursor = 0;
+        for code_range in code_ranges(node) {
+            let start = code_range.start.min(node_text.len());
+            let end = code_range.end.min(node_text.len());
+            if cursor < start {
+                append_text_segment(
+                    node,
+                    cursor..start,
+                    &mut text,
+                    &mut marks,
+                    &mut state,
+                    &mut offset,
+                );
+            }
+            flush_text_segment(&mut out, &mut text, &mut marks, &mut state, &mut offset);
+            if start < end {
+                out.push(ParagraphSegment::Code {
+                    text: node_text[start..end].to_string(),
+                    marks: marks_in_range(node, &(start..end), false),
+                    state: node.state.clone(),
+                });
+            }
+            cursor = end;
+        }
+        if cursor < node_text.len() {
+            append_text_segment(
+                node,
+                cursor..node_text.len(),
+                &mut text,
+                &mut marks,
+                &mut state,
+                &mut offset,
+            );
+        }
+    }
+
+    flush_text_segment(&mut out, &mut text, &mut marks, &mut state, &mut offset);
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -1550,114 +1721,137 @@ impl Paragraph {
     fn should_render_inline_flow(&self) -> bool {
         let has_image = self.children.iter().any(|child| child.image.is_some());
         let has_text = self.children.iter().any(|child| !child.text.is_empty());
-        has_image && has_text
+        (has_image && has_text) || self.has_inline_code()
     }
 
     fn inline_flow_items(&self, node_cx: &NodeContext, cx: &mut App) -> Vec<InlineFlowItem> {
         let mut items = Vec::new();
-        let mut text = String::new();
-        let mut highlights: Vec<(Range<usize>, HighlightStyle)> = vec![];
-        let mut links: Vec<(Range<usize>, LinkMark)> = vec![];
-        let mut offset = 0;
+        let segments = split_paragraph_segments(&self.children);
+        let last_text_ix = segments.iter().rposition(|segment| {
+            matches!(
+                segment,
+                ParagraphSegment::Text { .. } | ParagraphSegment::Code { .. }
+            )
+        });
+        let had_image = segments
+            .iter()
+            .any(|segment| matches!(segment, ParagraphSegment::Image(_)));
 
-        for inline_node in &self.children {
-            let text_len = inline_node.text.len();
-            text.push_str(&inline_node.text);
-
-            if let Some(image) = &inline_node.image {
-                if !text.is_empty() {
-                    if let Ok(mut state) = inline_node.state.lock() {
+        for (ix, segment) in segments.into_iter().enumerate() {
+            match segment {
+                ParagraphSegment::Text { text, marks, state } => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let state = if had_image && last_text_ix == Some(ix) {
+                        self.state.clone()
+                    } else {
+                        state
+                    };
+                    let (highlights, links) = highlights_from_marks(&marks, node_cx, cx);
+                    if let Ok(mut state) = state.lock() {
                         state.set_text(text.clone().into());
                     }
                     items.push(InlineFlowItem::Text {
-                        state: inline_node.state.clone(),
-                        text: text.clone().into(),
-                        links: links.clone(),
-                        highlights: highlights.clone(),
+                        state,
+                        text: text.into(),
+                        links,
+                        highlights,
                     });
                 }
-
-                items.push(InlineFlowItem::Image {
-                    url: image.url.clone(),
-                    link: image.link.clone(),
-                    title: image.title(),
-                    width: image.width,
-                    height: image.height,
-                });
-
-                text.clear();
-                links.clear();
-                highlights.clear();
-                offset = 0;
-            } else {
-                let mut node_highlights = vec![];
-                for (range, style) in &inline_node.marks {
-                    let inner_range = (offset + range.start)..(offset + range.end);
-
-                    let mut highlight = HighlightStyle::default();
-                    if style.bold {
-                        highlight.font_weight = Some(FontWeight::BOLD);
+                ParagraphSegment::Code { text, marks, state } => {
+                    if text.is_empty() {
+                        continue;
                     }
-                    if style.italic {
-                        highlight.font_style = Some(FontStyle::Italic);
+                    let (mut highlights, links) = highlights_from_marks(&marks, node_cx, cx);
+                    let mut code_style = node_cx.style.inline_code_highlight(cx);
+                    let background = code_style
+                        .background_color
+                        .unwrap_or_else(|| cx.theme().accent);
+                    code_style.background_color = None;
+                    highlights.insert(0, (0..text.len(), code_style));
+                    if let Ok(mut state) = state.lock() {
+                        state.set_text(text.clone().into());
                     }
-                    if style.strikethrough {
-                        highlight.strikethrough = Some(gpui::StrikethroughStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-                    }
-                    if style.underline {
-                        highlight.underline = Some(gpui::UnderlineStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-                    }
-                    if style.code {
-                        highlight = highlight.highlight(node_cx.style.inline_code_highlight(cx));
-                    }
-                    if let Some(color) = style.highlight {
-                        highlight.background_color = Some(color);
-                    }
-
-                    if let Some(mut link_mark) = style.link.clone() {
-                        highlight.color = Some(cx.theme().link);
-                        highlight.underline = Some(gpui::UnderlineStyle {
-                            thickness: gpui::px(1.),
-                            ..Default::default()
-                        });
-
-                        if let Some(identifier) = link_mark.identifier.as_ref()
-                            && let Some(mark) = node_cx.link_refs.get(identifier)
-                        {
-                            link_mark = mark.clone();
-                        }
-
-                        links.push((inner_range.clone(), link_mark));
-                    }
-
-                    node_highlights.push((inner_range, highlight));
+                    items.push(InlineFlowItem::Code {
+                        state,
+                        text: text.into(),
+                        links,
+                        highlights,
+                        background,
+                    });
                 }
-
-                highlights = gpui::combine_highlights(highlights, node_highlights).collect();
-                offset += text_len;
+                ParagraphSegment::Image(image) => {
+                    items.push(InlineFlowItem::Image {
+                        url: image.url.clone(),
+                        link: image.link.clone(),
+                        title: image.title(),
+                        width: image.width,
+                        height: image.height,
+                    });
+                }
             }
-        }
-
-        if !text.is_empty() {
-            if let Ok(mut state) = self.state.lock() {
-                state.set_text(text.clone().into());
-            }
-            items.push(InlineFlowItem::Text {
-                state: self.state.clone(),
-                text: text.into(),
-                links,
-                highlights,
-            });
         }
 
         items
     }
+}
+
+fn highlights_from_marks(
+    marks: &[(Range<usize>, TextMark)],
+    node_cx: &NodeContext,
+    cx: &App,
+) -> (
+    Vec<(Range<usize>, HighlightStyle)>,
+    Vec<(Range<usize>, LinkMark)>,
+) {
+    let mut highlights = Vec::new();
+    let mut links = Vec::new();
+
+    for (range, style) in marks {
+        let mut highlight = HighlightStyle::default();
+        if style.bold {
+            highlight.font_weight = Some(FontWeight::BOLD);
+        }
+        if style.italic {
+            highlight.font_style = Some(FontStyle::Italic);
+        }
+        if style.strikethrough {
+            highlight.strikethrough = Some(gpui::StrikethroughStyle {
+                thickness: gpui::px(1.),
+                ..Default::default()
+            });
+        }
+        if style.underline {
+            highlight.underline = Some(gpui::UnderlineStyle {
+                thickness: gpui::px(1.),
+                ..Default::default()
+            });
+        }
+        if let Some(color) = style.highlight {
+            highlight.background_color = Some(color);
+        }
+
+        if let Some(mut link_mark) = style.link.clone() {
+            highlight.color = Some(cx.theme().link);
+            highlight.underline = Some(gpui::UnderlineStyle {
+                thickness: gpui::px(1.),
+                ..Default::default()
+            });
+
+            if let Some(identifier) = link_mark.identifier.as_ref()
+                && let Some(mark) = node_cx.link_refs.get(identifier)
+            {
+                link_mark = mark.clone();
+            }
+
+            links.push((range.clone(), link_mark));
+        }
+
+        highlights.push((range.clone(), highlight));
+    }
+
+    (highlights, links)
 }
 
 impl Paragraph {
@@ -3050,6 +3244,78 @@ mod tests {
         assert_eq!(
             document.selected_text(SelectionFormat::Source, None),
             "# Title\n\nA paragraph.\n\n```rust\nlet x = 1;\n```\n\n1. one\n2. two"
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum SegmentKind {
+        Text(String),
+        Code(String),
+        Image,
+    }
+
+    fn segment_kinds(children: Vec<InlineNode>) -> Vec<SegmentKind> {
+        split_paragraph_segments(&children)
+            .into_iter()
+            .map(|segment| match segment {
+                ParagraphSegment::Text { text, .. } => SegmentKind::Text(text),
+                ParagraphSegment::Code { text, .. } => SegmentKind::Code(text),
+                ParagraphSegment::Image(_) => SegmentKind::Image,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inline_code_is_split_out_as_its_own_segment() {
+        let children = vec![
+            InlineNode::new("see "),
+            InlineNode::new("TaskStore").marks(vec![(0..9, TextMark::default().code())]),
+            InlineNode::new(" and "),
+            InlineNode::new("tasks.rs").marks(vec![(0..8, TextMark::default().code())]),
+            InlineNode::new("."),
+        ];
+
+        assert_eq!(
+            segment_kinds(children),
+            vec![
+                SegmentKind::Text("see ".into()),
+                SegmentKind::Code("TaskStore".into()),
+                SegmentKind::Text(" and ".into()),
+                SegmentKind::Code("tasks.rs".into()),
+                SegmentKind::Text(".".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn code_segment_keeps_source_text_without_padding_spaces() {
+        let children = vec![
+            InlineNode::new("OnceLock<RwLock<TaskFile>>")
+                .marks(vec![(0..26, TextMark::default().code())]),
+        ];
+
+        match &split_paragraph_segments(&children)[0] {
+            ParagraphSegment::Code { text, .. } => {
+                assert_eq!(text, "OnceLock<RwLock<TaskFile>>");
+                assert!(!text.starts_with(' '));
+                assert!(!text.ends_with(' '));
+            }
+            other => panic!("expected code segment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_code_mark_splits_a_single_node() {
+        let children =
+            vec![InlineNode::new("abXYcd").marks(vec![(2..4, TextMark::default().code())])];
+
+        assert_eq!(
+            segment_kinds(children),
+            vec![
+                SegmentKind::Text("ab".into()),
+                SegmentKind::Code("XY".into()),
+                SegmentKind::Text("cd".into()),
+            ]
         );
     }
 
