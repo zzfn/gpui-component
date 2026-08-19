@@ -8,12 +8,11 @@ use gpui::{
     GlobalElementId, HighlightStyle, Hsla, InspectorElementId, InteractiveElement as _,
     IntoElement, LayoutId, LineFragment as WrapLineFragment, ObjectFit, ParentElement as _, Pixels,
     ShapedLine, SharedString, SharedUri, Size, StatefulInteractiveElement as _, Styled,
-    StyledImage as _, TextRun, TextStyle, WhiteSpace, Window, img, point,
+    StyledImage as _, TextRun, TextStyle, WhiteSpace, Window, div, img, point,
     prelude::FluentBuilder as _, px, relative, size,
 };
 
 use crate::{
-    h_flex,
     text::text_view::{LinkClickHandlerFn, handle_link_click},
     tooltip::Tooltip,
 };
@@ -198,11 +197,13 @@ impl InlineFlow {
         if let Ok(mut state) = state.lock() {
             state.set_text(text);
         }
-        h_flex()
+        // 胶囊和左右正文共用同一行盒：高度就是 line-height，文字从行盒顶部起排。
+        // 不能 `items_center`——那样会把字形垂直居中到行高里，中英混排时胶囊
+        // 文字会比两侧低一截。
+        div()
             .id(ix)
             .h(size.height)
             .px(INLINE_CODE_PAD_X)
-            .items_center()
             .rounded(px(4.))
             .bg(background)
             .child(Inline::new(
@@ -923,6 +924,13 @@ mod tests {
     #[test]
     fn inline_code_chip_reserves_horizontal_padding() {
         assert_eq!(code_chip_size(px(40.), px(20.)), size(px(50.), px(20.)));
+    }
+
+    #[test]
+    fn inline_code_chip_height_matches_line_box_without_extra_vertical_padding() {
+        // 行高直接当胶囊高度，不在测量里加 py。垂直对齐靠和正文同一行盒原点，
+        // 而不是把文字在胶囊里再居中。
+        assert_eq!(code_chip_size(px(12.), px(22.)).height, px(22.));
     }
 
     #[test]
