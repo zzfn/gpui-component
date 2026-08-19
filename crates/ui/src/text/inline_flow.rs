@@ -21,7 +21,7 @@ use crate::{
 pub(super) const INLINE_CODE_PAD_X: Pixels = px(5.);
 
 use super::{
-    inline::{Inline, InlineState},
+    inline::{Inline, InlineState, runs_for_highlights},
     node::LinkMark,
     utils::image_source,
 };
@@ -845,50 +845,6 @@ fn inline_image_size_for_line(
         .unwrap_or(1.);
 
     size((height * aspect_ratio).max(px(1.)), height.max(px(1.)))
-}
-
-fn runs_for_highlights(
-    text: &str,
-    default_style: &TextStyle,
-    highlights: Vec<(Range<usize>, HighlightStyle)>,
-) -> Vec<TextRun> {
-    let mut highlights: Vec<_> = gpui::combine_highlights(Vec::new(), highlights).collect();
-    highlights.retain(|(range, _)| {
-        range.start < range.end
-            && range.end <= text.len()
-            && text.is_char_boundary(range.start)
-            && text.is_char_boundary(range.end)
-    });
-    highlights.sort_by_key(|(range, _)| range.start);
-
-    let mut runs = Vec::new();
-    let mut ix = 0;
-
-    for (range, highlight) in highlights {
-        if range.end <= ix {
-            continue;
-        }
-        let start = range.start.max(ix);
-        if start >= range.end || !text.is_char_boundary(start) {
-            continue;
-        }
-        if ix < start {
-            runs.push(default_style.clone().to_run(start - ix));
-        }
-        runs.push(
-            default_style
-                .clone()
-                .highlight(highlight)
-                .to_run(range.end - start),
-        );
-        ix = range.end;
-    }
-
-    if ix < text.len() {
-        runs.push(default_style.to_run(text.len() - ix));
-    }
-
-    runs
 }
 
 fn shape_line(

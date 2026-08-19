@@ -9,7 +9,7 @@ use gpui::{
     App, BorderStyle, Bounds, ClickEvent, CursorStyle, Edges, Element, ElementId, GlobalElementId,
     Half, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    SharedString, StyledText, TextLayout, Window, point, px, quad,
+    SharedString, StyledText, TextLayout, TextRun, TextStyle, Window, point, px, quad,
 };
 
 use crate::{
@@ -356,20 +356,7 @@ impl Element for Inline {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let text_style = window.text_style();
-
-        let mut runs = Vec::new();
-        let mut ix = 0;
-        for (range, highlight) in self.highlights.iter() {
-            if ix < range.start {
-                runs.push(text_style.clone().to_run(range.start - ix));
-            }
-            runs.push(text_style.clone().highlight(*highlight).to_run(range.len()));
-            ix = range.end;
-        }
-        if ix < self.text.len() {
-            runs.push(text_style.to_run(self.text.len() - ix));
-        }
-
+        let runs = runs_for_highlights(&self.text, &text_style, self.highlights.clone());
         self.styled_text = StyledText::new(self.text.clone()).with_runs(runs);
         let (layout_id, _) =
             self.styled_text
@@ -563,6 +550,55 @@ impl Element for Inline {
     }
 }
 
+/// Combine markdown/code highlights into StyledText runs.
+///
+/// Ranges that overlap, go past the text, or split a UTF-8 character are
+/// dropped or clipped. Inline `code` plus bold/link used to accumulate run
+/// lengths past `text.len()`, and `StyledText::with_runs` panics on CJK.
+pub(super) fn runs_for_highlights(
+    text: &str,
+    default_style: &TextStyle,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+) -> Vec<TextRun> {
+    let mut highlights: Vec<_> = gpui::combine_highlights(Vec::new(), highlights).collect();
+    highlights.retain(|(range, _)| {
+        range.start < range.end
+            && range.end <= text.len()
+            && text.is_char_boundary(range.start)
+            && text.is_char_boundary(range.end)
+    });
+    highlights.sort_by_key(|(range, _)| range.start);
+
+    let mut runs = Vec::new();
+    let mut ix = 0;
+
+    for (range, highlight) in highlights {
+        if range.end <= ix {
+            continue;
+        }
+        let start = range.start.max(ix);
+        if start >= range.end || !text.is_char_boundary(start) {
+            continue;
+        }
+        if ix < start {
+            runs.push(default_style.clone().to_run(start - ix));
+        }
+        runs.push(
+            default_style
+                .clone()
+                .highlight(highlight)
+                .to_run(range.end - start),
+        );
+        ix = range.end;
+    }
+
+    if ix < text.len() {
+        runs.push(default_style.to_run(text.len() - ix));
+    }
+
+    runs
+}
+
 fn selection_for_multi_click(
     text: &str,
     text_layout: &TextLayout,
@@ -630,8 +666,8 @@ fn point_in_text_selection(
 
 #[cfg(test)]
 mod tests {
-    use super::point_in_text_selection;
-    use gpui::{point, px};
+    use super::{point_in_text_selection, runs_for_highlights};
+    use gpui::{HighlightStyle, StyledText, TextStyle, point, px};
 
     #[test]
     fn test_point_in_text_selection() {
@@ -882,5 +918,24 @@ mod tests {
             end,
             line_height
         ));
+    }
+
+    #[test]
+    fn overlapping_cjk_highlights_match_text_len_for_styled_text() {
+        let text = "任务.rs";
+        let first_char = text.chars().next().unwrap().len_utf8();
+        let mut bold = HighlightStyle::default();
+        bold.font_weight = Some(gpui::FontWeight::BOLD);
+        let runs = runs_for_highlights(
+            text,
+            &TextStyle::default(),
+            vec![
+                (0..text.len(), HighlightStyle::default()),
+                (0..first_char, bold),
+            ],
+        );
+        let covered: usize = runs.iter().map(|run| run.len).sum();
+        assert_eq!(covered, text.len());
+        let _ = StyledText::new(text).with_runs(runs);
     }
 }
