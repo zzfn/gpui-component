@@ -83,6 +83,10 @@ enum PositionedFragment {
         item_ix: usize,
         origin: gpui::Point<Pixels>,
         size: Size<Pixels>,
+        source_range: Range<usize>,
+        text: SharedString,
+        links: Vec<(Range<usize>, LinkMark)>,
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
     },
     Image {
         item_ix: usize,
@@ -99,6 +103,7 @@ enum MeasureItem {
     },
     Code {
         text: SharedString,
+        links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
     },
     Image {
@@ -121,7 +126,11 @@ enum LineFragmentKind {
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
     },
-    Code,
+    Code {
+        text: SharedString,
+        links: Vec<(Range<usize>, LinkMark)>,
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
+    },
     Image,
 }
 
@@ -204,6 +213,7 @@ impl InlineFlow {
             .id(ix)
             .h(size.height)
             .px(INLINE_CODE_PAD_X)
+            .whitespace_nowrap()
             .rounded(px(4.))
             .bg(background)
             .child(Inline::new(
@@ -262,9 +272,9 @@ impl Element for InlineFlow {
                     window,
                     cx,
                 )),
-                MeasureItem::Code { text, highlights } => {
-                    Some(measure_code_size(text, highlights, &text_style, window))
-                }
+                MeasureItem::Code {
+                    text, highlights, ..
+                } => Some(measure_code_size(text, highlights, &text_style, window)),
                 MeasureItem::Text { .. } => None,
             })
             .collect::<Vec<_>>();
@@ -364,23 +374,31 @@ impl Element for InlineFlow {
                     item_ix,
                     origin,
                     size: fragment_size,
+                    source_range,
+                    text,
+                    links,
+                    highlights,
                 } => {
                     let InlineFlowItem::Code {
                         state,
-                        text,
-                        links,
-                        highlights,
+                        text: source,
                         background,
+                        ..
                     } = &self.items[item_ix]
                     else {
                         continue;
                     };
+                    let state = if source_range == (0..source.len()) {
+                        state.clone()
+                    } else {
+                        Arc::new(Mutex::new(InlineState::default()))
+                    };
                     let mut element = Self::code_element(
                         elements.len(),
-                        state.clone(),
-                        text.clone(),
-                        links.clone(),
-                        highlights.clone(),
+                        state,
+                        text,
+                        links,
+                        highlights,
                         fragment_size,
                         *background,
                         self.link_click_handler.clone(),
@@ -463,9 +481,13 @@ impl From<&InlineFlowItem> for MeasureItem {
                 highlights: highlights.clone(),
             },
             InlineFlowItem::Code {
-                text, highlights, ..
+                text,
+                links,
+                highlights,
+                ..
             } => MeasureItem::Code {
                 text: text.clone(),
+                links: links.clone(),
                 highlights: highlights.clone(),
             },
             InlineFlowItem::Image {
@@ -558,17 +580,40 @@ fn layout_flow(
                         });
                     }
                 }
-                MeasureItem::Code { .. } => {
-                    if line_range.start <= item_start && item_end <= line_range.end {
-                        let size = image_sizes[item_ix]
-                            .expect("code size should be measured before layout");
+                MeasureItem::Code {
+                    text,
+                    links,
+                    highlights,
+                } => {
+                    let local_start =
+                        (line_range.start.max(item_start) - item_start).min(text.len());
+                    let local_end = (line_range.end.min(item_end) - item_start).min(text.len());
+                    if local_start < local_end {
+                        let subtext = SharedString::from(text[local_start..local_end].to_string());
+                        let highlights =
+                            slice_ranges(highlights, local_start, local_end, |range, style| {
+                                (range, *style)
+                            });
+                        let links = slice_ranges(links, local_start, local_end, |range, link| {
+                            (range, link.clone())
+                        });
+                        let size = if local_start == 0 && local_end == text.len() {
+                            image_sizes[item_ix]
+                                .expect("code size should be measured before layout")
+                        } else {
+                            measure_code_size(&subtext, &highlights, text_style, window)
+                        };
                         line_width += size.width;
                         actual_line_height = actual_line_height.max(size.height);
                         line_fragments.push(LineFragmentLayout {
                             item_ix,
-                            kind: LineFragmentKind::Code,
+                            kind: LineFragmentKind::Code {
+                                text: subtext,
+                                links,
+                                highlights,
+                            },
                             size,
-                            source_range: 0..item.len(),
+                            source_range: local_start..local_end,
                         });
                     }
                 }
@@ -608,10 +653,18 @@ fn layout_flow(
                     links,
                     highlights,
                 },
-                LineFragmentKind::Code => PositionedFragment::Code {
+                LineFragmentKind::Code {
+                    text,
+                    links,
+                    highlights,
+                } => PositionedFragment::Code {
                     item_ix: fragment.item_ix,
                     origin,
                     size: fragment.size,
+                    source_range: fragment.source_range,
+                    text,
+                    links,
+                    highlights,
                 },
                 LineFragmentKind::Image => PositionedFragment::Image {
                     item_ix: fragment.item_ix,
@@ -683,16 +736,25 @@ fn line_ranges(
                             let end = hard_line.end.min(item_end) - item_start;
                             (start < end).then(|| WrapLineFragment::text(&text[start..end]))
                         }
-                        MeasureItem::Code { text, .. } => (hard_line.start <= item_start
-                            && item_end <= hard_line.end)
-                            .then(|| {
-                                WrapLineFragment::element(
-                                    image_sizes[ix]
-                                        .expect("code size should be measured before wrapping")
-                                        .width,
-                                    text.len().max(1),
+                        MeasureItem::Code { text, .. } => {
+                            let start =
+                                (hard_line.start.max(item_start) - item_start).min(text.len());
+                            let end = (hard_line.end.min(item_end) - item_start).min(text.len());
+                            let chip_width = image_sizes[ix]
+                                .expect("code size should be measured before wrapping")
+                                .width;
+                            if start < end {
+                                Some(if code_wraps_internally(chip_width, wrap_width) {
+                                    WrapLineFragment::text(&text[start..end])
+                                } else {
+                                    WrapLineFragment::element(chip_width, (end - start).max(1))
+                                })
+                            } else {
+                                (hard_line.start <= item_start && item_end <= hard_line.end).then(
+                                    || WrapLineFragment::element(chip_width, text.len().max(1)),
                                 )
-                            }),
+                            }
+                        }
                         MeasureItem::Image { .. } => (hard_line.start <= item_start
                             && item_end <= hard_line.end)
                             .then(|| {
@@ -750,6 +812,13 @@ fn measure_code_size(
 
 fn code_chip_size(text_width: Pixels, line_height: Pixels) -> Size<Pixels> {
     size(text_width + INLINE_CODE_PAD_X * 2., line_height)
+}
+
+/// 胶囊比整行还宽时，不能再当不可拆的 element：GPUI 会把它整块留在当前行，
+/// 内部 StyledText 自己折行，第二行画出胶囊底色外——`foo-dark` 有高亮、
+/// `/light.svg` 变成普通字。改按正文一样按字符折，每段单独画一颗胶囊。
+fn code_wraps_internally(chip_width: Pixels, wrap_width: Pixels) -> bool {
+    chip_width > wrap_width
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -887,6 +956,19 @@ mod tests {
         // 行高直接当胶囊高度，不在测量里加 py。垂直对齐靠和正文同一行盒原点，
         // 而不是把文字在胶囊里再居中。
         assert_eq!(code_chip_size(px(12.), px(22.)).height, px(22.));
+    }
+
+    #[test]
+    fn short_code_chip_stays_atomic() {
+        assert!(!code_wraps_internally(px(120.), px(400.)));
+        assert!(!code_wraps_internally(px(400.), px(400.)));
+    }
+
+    #[test]
+    fn code_wider_than_line_wraps_internally() {
+        // 复现：`sha256(...)-dark/light.svg` 比行宽更长时，必须按字符折，
+        // 否则 `/light.svg` 会掉出胶囊。
+        assert!(code_wraps_internally(px(401.), px(400.)));
     }
 
     #[test]
