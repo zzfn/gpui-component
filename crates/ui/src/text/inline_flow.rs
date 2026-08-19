@@ -358,6 +358,7 @@ impl Element for InlineFlow {
                         highlights,
                         self.link_click_handler.clone(),
                     )
+                    .rounded_fill()
                     .into_any_element();
                     element.prepaint_as_root(
                         bounds.origin + origin,

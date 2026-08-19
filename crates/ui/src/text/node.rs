@@ -1132,16 +1132,10 @@ impl Paragraph {
     pub(crate) fn merge(&mut self, other: Self) {
         self.children.extend(other.children);
     }
-
-    fn has_inline_code(&self) -> bool {
-        self.children
-            .iter()
-            .any(|child| child.marks.iter().any(|(_, mark)| mark.code))
-    }
 }
 
-/// Paragraph pieces after splitting out inline code so it can be laid out as a
-/// padded chip instead of a flush `HighlightStyle` background.
+/// Paragraph pieces after splitting out inline images. Inline `code` stays on
+/// the text run so wrapping and spacing follow the surrounding glyphs.
 #[derive(Clone, Debug)]
 pub(super) enum ParagraphSegment {
     Text {
@@ -1149,24 +1143,15 @@ pub(super) enum ParagraphSegment {
         marks: Vec<(Range<usize>, TextMark)>,
         state: Arc<Mutex<InlineState>>,
     },
+    /// Kept so image+text inline-flow can still emit a chip if we ever need it
+    /// again. Markdown inline `code` no longer uses this — it stays in `Text`.
+    #[allow(dead_code)]
     Code {
         text: String,
         marks: Vec<(Range<usize>, TextMark)>,
         state: Arc<Mutex<InlineState>>,
     },
     Image(ImageNode),
-}
-
-fn code_ranges(node: &InlineNode) -> Vec<Range<usize>> {
-    let mut ranges = node
-        .marks
-        .iter()
-        .filter(|(_, mark)| mark.code)
-        .map(|(range, _)| range.clone())
-        .collect::<Vec<_>>();
-    ranges.sort_by_key(|range| range.start);
-    ranges.dedup();
-    ranges
 }
 
 fn marks_in_range(
@@ -1210,7 +1195,7 @@ fn append_text_segment(
     }
     let start = *offset;
     text.push_str(slice);
-    for (mark_range, mark) in marks_in_range(node, &range, false) {
+    for (mark_range, mark) in marks_in_range(node, &range, true) {
         marks.push(((start + mark_range.start)..(start + mark_range.end), mark));
     }
     if state.is_none() {
@@ -1239,7 +1224,9 @@ fn flush_text_segment(
     *offset = 0;
 }
 
-/// Split paragraph children so inline `code` becomes its own segment.
+/// Split paragraph children on inline images. Inline `code` stays in the text
+/// run — splitting it into padded chip boxes blew up spacing, wrapping and
+/// baseline alignment (short spans like `:` flew to the far right of the line).
 pub(super) fn split_paragraph_segments(children: &[InlineNode]) -> Vec<ParagraphSegment> {
     let mut out = Vec::new();
     let mut text = String::new();
@@ -1264,41 +1251,14 @@ pub(super) fn split_paragraph_segments(children: &[InlineNode]) -> Vec<Paragraph
             continue;
         }
 
-        let node_text = node.text.as_ref();
-        let mut cursor = 0;
-        for code_range in code_ranges(node) {
-            let start = code_range.start.min(node_text.len());
-            let end = code_range.end.min(node_text.len());
-            if cursor < start {
-                append_text_segment(
-                    node,
-                    cursor..start,
-                    &mut text,
-                    &mut marks,
-                    &mut state,
-                    &mut offset,
-                );
-            }
-            flush_text_segment(&mut out, &mut text, &mut marks, &mut state, &mut offset);
-            if start < end {
-                out.push(ParagraphSegment::Code {
-                    text: node_text[start..end].to_string(),
-                    marks: marks_in_range(node, &(start..end), false),
-                    state: node.state.clone(),
-                });
-            }
-            cursor = end;
-        }
-        if cursor < node_text.len() {
-            append_text_segment(
-                node,
-                cursor..node_text.len(),
-                &mut text,
-                &mut marks,
-                &mut state,
-                &mut offset,
-            );
-        }
+        append_text_segment(
+            node,
+            0..node.text.len(),
+            &mut text,
+            &mut marks,
+            &mut state,
+            &mut offset,
+        );
     }
 
     flush_text_segment(&mut out, &mut text, &mut marks, &mut state, &mut offset);
@@ -1589,6 +1549,7 @@ impl Paragraph {
                             highlights.clone(),
                             node_cx.link_click_handler.clone(),
                         )
+                        .rounded_fill()
                         .into_any_element(),
                     );
                 }
@@ -1708,6 +1669,7 @@ impl Paragraph {
                     highlights,
                     node_cx.link_click_handler.clone(),
                 )
+                .rounded_fill()
                 .into_any_element(),
             );
         }
@@ -1721,7 +1683,7 @@ impl Paragraph {
     fn should_render_inline_flow(&self) -> bool {
         let has_image = self.children.iter().any(|child| child.image.is_some());
         let has_text = self.children.iter().any(|child| !child.text.is_empty());
-        (has_image && has_text) || self.has_inline_code()
+        has_image && has_text
     }
 
     fn inline_flow_items(&self, node_cx: &NodeContext, cx: &mut App) -> Vec<InlineFlowItem> {
@@ -1829,6 +1791,9 @@ fn highlights_from_marks(
                 thickness: gpui::px(1.),
                 ..Default::default()
             });
+        }
+        if style.code {
+            highlight = highlight.highlight(node_cx.style.inline_code_highlight(cx));
         }
         if let Some(color) = style.highlight {
             highlight.background_color = Some(color);
@@ -3268,7 +3233,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_code_is_split_out_as_its_own_segment() {
+    fn inline_code_stays_in_the_text_run() {
         let children = vec![
             InlineNode::new("see "),
             InlineNode::new("TaskStore").marks(vec![(0..9, TextMark::default().code())]),
@@ -3279,45 +3244,35 @@ mod tests {
 
         assert_eq!(
             segment_kinds(children),
-            vec![
-                SegmentKind::Text("see ".into()),
-                SegmentKind::Code("TaskStore".into()),
-                SegmentKind::Text(" and ".into()),
-                SegmentKind::Code("tasks.rs".into()),
-                SegmentKind::Text(".".into()),
-            ]
+            vec![SegmentKind::Text("see TaskStore and tasks.rs.".into())]
         );
     }
 
     #[test]
-    fn code_segment_keeps_source_text_without_padding_spaces() {
+    fn code_mark_does_not_insert_padding_spaces() {
         let children = vec![
             InlineNode::new("OnceLock<RwLock<TaskFile>>")
                 .marks(vec![(0..26, TextMark::default().code())]),
         ];
 
         match &split_paragraph_segments(&children)[0] {
-            ParagraphSegment::Code { text, .. } => {
+            ParagraphSegment::Text { text, marks, .. } => {
                 assert_eq!(text, "OnceLock<RwLock<TaskFile>>");
-                assert!(!text.starts_with(' '));
-                assert!(!text.ends_with(' '));
+                assert_eq!(marks.len(), 1);
+                assert!(marks[0].1.code);
             }
-            other => panic!("expected code segment, got {other:?}"),
+            other => panic!("expected text segment, got {other:?}"),
         }
     }
 
     #[test]
-    fn partial_code_mark_splits_a_single_node() {
+    fn partial_code_mark_stays_on_the_same_node() {
         let children =
             vec![InlineNode::new("abXYcd").marks(vec![(2..4, TextMark::default().code())])];
 
         assert_eq!(
             segment_kinds(children),
-            vec![
-                SegmentKind::Text("ab".into()),
-                SegmentKind::Code("XY".into()),
-                SegmentKind::Text("cd".into()),
-            ]
+            vec![SegmentKind::Text("abXYcd".into())]
         );
     }
 

@@ -22,6 +22,14 @@ use crate::{
     text::text_view::{LinkClickHandlerFn, handle_link_click},
 };
 
+/// Horizontal overhang for inline `code` backgrounds. Does not affect layout,
+/// so wrapping stays identical to the surrounding sentence.
+const INLINE_CODE_BG_PAD_X: Pixels = px(3.);
+/// Vertical inset from the line box so the fill hugs the glyphs instead of
+/// becoming a full-height pill.
+const INLINE_CODE_BG_PAD_Y: Pixels = px(2.);
+const INLINE_CODE_BG_RADIUS: Pixels = px(3.);
+
 /// A inline element used to render a inline text and support selectable.
 ///
 /// All text in TextView (including the CodeBlock) used this for text rendering.
@@ -32,6 +40,9 @@ pub(super) struct Inline {
     highlights: Vec<(Range<usize>, HighlightStyle)>,
     styled_text: StyledText,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    /// Paint highlight fills as padded rounded rects instead of flush glyph
+    /// backgrounds. Markdown inline `code` uses this; fenced code blocks don't.
+    rounded_fill: bool,
 
     state: Arc<Mutex<InlineState>>,
 }
@@ -72,8 +83,14 @@ impl Inline {
             text: text.clone(),
             styled_text: StyledText::new(text),
             link_click_handler,
+            rounded_fill: false,
             state,
         }
+    }
+
+    pub(super) fn rounded_fill(mut self) -> Self {
+        self.rounded_fill = true;
+        self
     }
 
     /// Get link at given mouse position.
@@ -328,6 +345,98 @@ impl Inline {
     }
 }
 
+fn highlights_without_fill(
+    highlights: &[(Range<usize>, HighlightStyle)],
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    highlights
+        .iter()
+        .map(|(range, highlight)| {
+            let mut highlight = *highlight;
+            highlight.background_color = None;
+            (range.clone(), highlight)
+        })
+        .collect()
+}
+
+fn paint_rounded_highlight_fills(
+    highlights: &[(Range<usize>, HighlightStyle)],
+    text_layout: &TextLayout,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    let line_height = text_layout.line_height();
+    for (range, highlight) in highlights {
+        let Some(color) = highlight.background_color else {
+            continue;
+        };
+        if range.start >= range.end {
+            continue;
+        }
+        let Some(start_position) = text_layout.position_for_index(range.start) else {
+            continue;
+        };
+        let Some(end_position) = text_layout.position_for_index(range.end) else {
+            continue;
+        };
+        for rect in rounded_fill_rects(start_position, end_position, line_height, bounds) {
+            window.paint_quad(quad(
+                rect,
+                INLINE_CODE_BG_RADIUS,
+                color,
+                Edges::default(),
+                gpui::transparent_black(),
+                BorderStyle::default(),
+            ));
+        }
+    }
+}
+
+fn rounded_fill_rects(
+    start_position: Point<Pixels>,
+    end_position: Point<Pixels>,
+    line_height: Pixels,
+    bounds: Bounds<Pixels>,
+) -> Vec<Bounds<Pixels>> {
+    let pad_x = INLINE_CODE_BG_PAD_X;
+    let pad_y = INLINE_CODE_BG_PAD_Y;
+    let inset = |left: Pixels, top: Pixels, right: Pixels, bottom: Pixels| {
+        Bounds::from_corners(
+            point(left - pad_x, top + pad_y),
+            point(right + pad_x, bottom - pad_y),
+        )
+    };
+    if start_position.y == end_position.y {
+        vec![inset(
+            start_position.x,
+            start_position.y,
+            end_position.x,
+            end_position.y + line_height,
+        )]
+    } else {
+        let mut rects = vec![inset(
+            start_position.x,
+            start_position.y,
+            bounds.right(),
+            start_position.y + line_height,
+        )];
+        if end_position.y > start_position.y + line_height {
+            rects.push(inset(
+                bounds.left(),
+                start_position.y + line_height,
+                bounds.right(),
+                end_position.y,
+            ));
+        }
+        rects.push(inset(
+            bounds.left(),
+            end_position.y,
+            end_position.x,
+            end_position.y + line_height,
+        ));
+        rects
+    }
+}
+
 impl IntoElement for Inline {
     type Element = Self;
 
@@ -356,7 +465,15 @@ impl Element for Inline {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let text_style = window.text_style();
-        let runs = runs_for_highlights(&self.text, &text_style, self.highlights.clone());
+        let runs = runs_for_highlights(
+            &self.text,
+            &text_style,
+            if self.rounded_fill {
+                highlights_without_fill(&self.highlights)
+            } else {
+                self.highlights.clone()
+            },
+        );
         self.styled_text = StyledText::new(self.text.clone()).with_runs(runs);
         let (layout_id, _) =
             self.styled_text
@@ -398,6 +515,9 @@ impl Element for Inline {
         };
 
         let text_layout = self.styled_text.layout().clone();
+        if self.rounded_fill {
+            paint_rounded_highlight_fills(&self.highlights, &text_layout, bounds, window);
+        }
         self.styled_text
             .paint(global_id, None, bounds, &mut (), &mut (), window, cx);
 
@@ -666,8 +786,11 @@ fn point_in_text_selection(
 
 #[cfg(test)]
 mod tests {
-    use super::{point_in_text_selection, runs_for_highlights};
-    use gpui::{HighlightStyle, StyledText, TextStyle, point, px};
+    use super::{
+        INLINE_CODE_BG_PAD_X, INLINE_CODE_BG_PAD_Y, point_in_text_selection, rounded_fill_rects,
+        runs_for_highlights,
+    };
+    use gpui::{Bounds, HighlightStyle, StyledText, TextStyle, point, px};
 
     #[test]
     fn test_point_in_text_selection() {
@@ -937,5 +1060,24 @@ mod tests {
         let covered: usize = runs.iter().map(|run| run.len).sum();
         assert_eq!(covered, text.len());
         let _ = StyledText::new(text).with_runs(runs);
+    }
+
+    #[test]
+    fn rounded_fill_hugs_glyphs_instead_of_filling_the_line_box() {
+        let line_height = px(20.);
+        let bounds = Bounds::from_corners(point(px(0.), px(0.)), point(px(200.), px(20.)));
+        let rects = rounded_fill_rects(
+            point(px(40.), px(0.)),
+            point(px(80.), px(0.)),
+            line_height,
+            bounds,
+        );
+        assert_eq!(rects.len(), 1);
+        let rect = rects[0];
+        assert_eq!(rect.origin.x, px(40.) - INLINE_CODE_BG_PAD_X);
+        assert_eq!(rect.origin.y, INLINE_CODE_BG_PAD_Y);
+        assert_eq!(rect.bottom(), line_height - INLINE_CODE_BG_PAD_Y);
+        assert!(rect.size.height < line_height);
+        assert!(rect.size.width > px(40.));
     }
 }
