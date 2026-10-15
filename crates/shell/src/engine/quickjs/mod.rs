@@ -2159,7 +2159,8 @@ impl ShellRuntime {
     /// the first half of the sandbox's module policy (design doc §19.1).
     pub(crate) fn load_app(self: &Rc<Self>, dir: &Path, entry: &str) -> Result<ViewType> {
         let root = crate::runtime::resolve_app_root(dir, entry)?;
-        if let Err(error) = self.write_type_declarations(&root) {
+        let editor_files = crate::writes_editor_files();
+        if editor_files && let Err(error) = self.write_type_declarations(&root) {
             tracing::debug!(
                 "could not update declarations in {}: {error}",
                 root.display()
@@ -2175,7 +2176,9 @@ impl ShellRuntime {
             // this load is not going to use. Best-effort, like the
             // declarations — a read-only directory is not a reason to refuse to
             // run.
-            if let Err(error) = self.dependency_store.link_for_editor(&root, &dependencies) {
+            if editor_files
+                && let Err(error) = self.dependency_store.link_for_editor(&root, &dependencies)
+            {
                 tracing::debug!(
                     "could not link dependencies for an editor in {}: {error:#}",
                     root.display()

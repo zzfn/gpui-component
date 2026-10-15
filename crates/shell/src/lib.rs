@@ -268,6 +268,31 @@ pub fn set_development_mode(enabled: bool) {
     engine::set_development_mode(enabled);
 }
 
+thread_local! {
+    // Per thread, like the default policy: applications load on the thread
+    // that renders them, and a test toggling it cannot reach another test.
+    static EDITOR_FILES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether loading an application refreshes the files an editor reads beside
+/// it — `gpui-kit.d.ts`, `jsconfig.json` and the links to its Git dependencies.
+///
+/// On by default, because the author running their own directory is who those
+/// files are for, and keeping them current on every run is what stops them
+/// drifting from the runtime. A host that ships applications inside its own
+/// bundle turns it off: the directory is read-only in principle (a signed
+/// `.app`, a package manager's tree), nobody edits the code there, and a write
+/// into a signed bundle breaks its seal. The explicit tooling entry points —
+/// [`write_type_declarations_with_components`], [`write_dependency_links`] —
+/// are unaffected.
+pub fn set_editor_files(enabled: bool) {
+    EDITOR_FILES.with(|cell| cell.set(enabled));
+}
+
+pub(crate) fn writes_editor_files() -> bool {
+    EDITOR_FILES.with(std::cell::Cell::get)
+}
+
 /// Initializes the base layer and style reflection table.
 ///
 /// Must be called once at application startup, before any script runs. This is

@@ -2103,6 +2103,31 @@ fn isolated_runtimes_write_their_own_component_declarations() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn loading_writes_no_editor_files_when_the_host_turned_them_off() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("gpui-shell-no-editor-files-{unique}"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("main.js"), "export default class App {}").unwrap();
+
+    crate::set_editor_files(false);
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let loaded = runtime.load_app(&root, "main.js");
+    crate::set_editor_files(true);
+    loaded.unwrap();
+
+    let mut left: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    left.sort();
+    assert_eq!(left, vec![std::ffi::OsString::from("main.js")]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[gpui::test]
 fn element_map_returns_the_transform_result(cx: &mut TestAppContext) {
     cx.update(crate::init);
