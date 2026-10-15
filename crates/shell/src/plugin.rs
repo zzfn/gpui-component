@@ -1194,6 +1194,7 @@ fn load_plugin(
     manifest: PluginManifest,
     root: PathBuf,
     data_dir: PathBuf,
+    extend: impl FnOnce(&PluginManifest, &Path, Policy) -> Result<Policy>,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<Plugin> {
@@ -1206,14 +1207,16 @@ fn load_plugin(
         );
     }
 
+    let policy = Policy::default()
+        // The manifest id is already unique among loaded plugins, which is
+        // exactly what a dock layout needs to keep two plugins' panels of the
+        // same name apart.
+        .with_application(&id)
+        .with_capabilities(manifest.capabilities(&root, &data_dir))
+        .with_storage_path(store_path.clone());
     let policy = Rc::new(
-        Policy::default()
-            // The manifest id is already unique among loaded plugins, which is
-            // exactly what a dock layout needs to keep two plugins' panels of
-            // the same name apart.
-            .with_application(&id)
-            .with_capabilities(manifest.capabilities(&root, &data_dir))
-            .with_storage_path(store_path.clone()),
+        extend(&manifest, &root, policy)
+            .with_context(|| format!("configuring the policy of `{id}`"))?,
     );
 
     let view = load_view_with_policy(runtime, &root, manifest.entry(), policy.clone(), window, cx)
@@ -1477,6 +1480,30 @@ impl PluginManager {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        self.load_with_policy(runtime, id, authorize, |_, _, policy| Ok(policy), window, cx)
+    }
+
+    /// [`Self::load`], with a say in the policy the plugin will run under.
+    ///
+    /// `extend` receives the approved manifest, the plugin's directory and the
+    /// policy built from the manifest, and returns the policy to use. It runs
+    /// after `authorize` and before any script, which is the one moment a host
+    /// can add what the manifest cannot express — the HostModules this plugin
+    /// may import above all, since "which host functions may this plugin call"
+    /// is as much a grant as "which directories may it read" and differs per
+    /// plugin. An error refuses the load the way a denial does: nothing runs.
+    ///
+    /// The returned policy is the plugin's for the rest of its life, exactly
+    /// as with [`Self::load`]; [`Self::unload`] cancels work created under it.
+    pub fn load_with_policy(
+        &mut self,
+        runtime: &Rc<ShellRuntime>,
+        id: &str,
+        authorize: impl FnOnce(&PluginManifest) -> bool,
+        extend: impl FnOnce(&PluginManifest, &Path, Policy) -> Result<Policy>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
         if !self.discovered {
             bail!(
                 "plugin discovery has not run; call PluginManager::discover() and handle every result before loading `{id}`"
@@ -1496,7 +1523,7 @@ impl PluginManager {
         }
         let root = entry.root.clone();
         let data_dir = self.data_dir(id);
-        let plugin = load_plugin(runtime, manifest, root, data_dir, window, cx)?;
+        let plugin = load_plugin(runtime, manifest, root, data_dir, extend, window, cx)?;
         self.loaded.insert(id.to_owned(), plugin);
 
         Ok(())
@@ -2043,6 +2070,89 @@ mod tests {
             settled.contains("loaded through plugin policy"),
             "async init did not invalidate its own view: {settled}"
         );
+    }
+
+    #[gpui::test]
+    fn load_with_policy_lends_host_modules_to_one_plugin_only(cx: &mut TestAppContext) {
+        let plugins = TempTree::new("host-modules");
+        let data = TempTree::new("host-modules-data");
+        let script = r#"
+            import { View } from "gpui-kit";
+            import { v_flex } from "gpui-base";
+            import { greeting } from "host-greeting";
+            export default class Panel extends View {
+              render(cx) { return v_flex().child(greeting()); }
+            }
+        "#;
+        for (directory, id) in [("lent", "com.example.lent"), ("plain", "com.example.plain")] {
+            let manifest =
+                format!(r#"{{ "id": "{id}", "name": "{directory}", "entry": "main.js" }}"#);
+            let root = plugins.plugin(directory, &manifest);
+            std::fs::write(root.join("main.js"), script).expect("write script");
+        }
+
+        cx.update(crate::init);
+        let runtime = ShellRuntime::new_isolated().expect("runtime");
+        cx.update(|cx| runtime.set_global(cx));
+        let window = cx.add_window(|_, _| Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let mut manager = PluginManager::new(vec![plugins.path().to_path_buf()])
+            .with_data_home(data.path().to_path_buf());
+        assert!(manager.discover().iter().all(Result::is_ok));
+
+        let refused = context
+            .update(|window, cx| {
+                manager.load_with_policy(
+                    &runtime,
+                    "com.example.lent",
+                    |_| true,
+                    |_, _, _| Err(anyhow::anyhow!("host refused")),
+                    window,
+                    cx,
+                )
+            })
+            .expect_err("a failing extension refuses the load");
+        assert!(format!("{refused:#}").contains("host refused"), "{refused:#}");
+        assert_eq!(manager.loaded().count(), 0);
+
+        context
+            .update(|window, cx| {
+                manager.load_with_policy(
+                    &runtime,
+                    "com.example.lent",
+                    |_| true,
+                    |manifest, root, policy| {
+                        assert_eq!(manifest.id(), "com.example.lent");
+                        assert!(root.join(MANIFEST_FILE).is_file());
+                        let text = format!("hello {}", manifest.name());
+                        policy
+                            .with_host_module(
+                                crate::HostModule::new("host-greeting").function(
+                                    "greeting",
+                                    move |_| Ok(crate::HostValue::from(text.as_str())),
+                                ),
+                            )
+                            .map_err(|error| anyhow::anyhow!(error.message().to_owned()))
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .expect("load with a lent module");
+        let view = manager
+            .plugin("com.example.lent")
+            .map(Plugin::view)
+            .expect("plugin view")
+            .clone();
+        draw(&mut context, &view);
+        assert!(snapshot_text(&mut context, &view).contains("hello lent"));
+
+        // The module was lent to that plugin's policy, not to the runtime.
+        context
+            .update(|window, cx| {
+                manager.load(&runtime, "com.example.plain", |_| true, window, cx)
+            })
+            .expect_err("another plugin cannot import a module it was not lent");
     }
 
     #[gpui::test]
