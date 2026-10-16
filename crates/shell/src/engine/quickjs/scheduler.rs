@@ -351,7 +351,7 @@ pub fn drain_after_render(
 #[allow(dead_code)]
 pub fn shutdown(runtime: &ShellRuntime) {
     let runtime = runtime as *const ShellRuntime;
-    TASKS.with_borrow_mut(|tasks| {
+    with_tasks_mut(|tasks| {
         let owned: Vec<_> = tasks
             .values()
             .filter(|task| task.runtime.as_ptr() == runtime)
@@ -373,7 +373,7 @@ pub fn shutdown(runtime: &ShellRuntime) {
 /// Plugin unload uses this before dropping its view so owner-less timers and
 /// host operations cannot retain or exercise the unloaded plugin's authority.
 pub(crate) fn cancel_policy(policy: &Rc<Policy>) {
-    TASKS.with_borrow_mut(|tasks| {
+    with_tasks_mut(|tasks| {
         let owned: Vec<_> = tasks
             .values()
             .filter(|task| {
@@ -448,7 +448,7 @@ pub(super) fn rollback_runtime_tasks(checkpoint: TaskCheckpoint) {
 }
 
 fn cancel_where(mut predicate: impl FnMut(&TaskState) -> bool) {
-    TASKS.with_borrow_mut(|tasks| {
+    with_tasks_mut(|tasks| {
         let cancelled: Vec<_> = tasks
             .values()
             .filter(|task| predicate(task))
@@ -839,6 +839,17 @@ thread_local! {
     /// `App` and every task here are all main-thread only.
     static TASKS: RefCell<HashMap<TaskId, Rc<TaskState>>> = RefCell::new(HashMap::new());
     static NEXT_TASK_ID: Cell<TaskId> = const { Cell::new(1) };
+}
+
+/// Borrow the task map. A no-op once the map's thread-local has been destroyed.
+///
+/// Exit destroys thread-locals in reverse order of first use. This map is
+/// created while plugins load, and the plugin registry is created earlier, so
+/// the registry's destructor runs after the map is already gone. `with` panics
+/// at that point (`panic_access_error`), and a panic inside that destructor
+/// aborts the process. The tasks were dropped with the map.
+fn with_tasks_mut(body: impl FnOnce(&mut HashMap<TaskId, Rc<TaskState>>)) {
+    let _ = TASKS.try_with(|tasks| body(&mut tasks.borrow_mut()));
 }
 
 struct TaskState {
